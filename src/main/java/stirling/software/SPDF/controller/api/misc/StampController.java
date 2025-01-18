@@ -1,6 +1,6 @@
 package stirling.software.SPDF.controller.api.misc;
 
-import java.awt.Color;
+import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -12,7 +12,6 @@ import java.util.List;
 import javax.imageio.ImageIO;
 
 import org.apache.commons.io.IOUtils;
-import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
@@ -25,6 +24,7 @@ import org.apache.pdfbox.pdmodel.graphics.image.LosslessFactory;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import org.apache.pdfbox.pdmodel.graphics.state.PDExtendedGraphicsState;
 import org.apache.pdfbox.util.Matrix;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ModelAttribute;
@@ -38,6 +38,7 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 
 import stirling.software.SPDF.model.api.misc.AddStampRequest;
+import stirling.software.SPDF.service.CustomPDDocumentFactory;
 import stirling.software.SPDF.utils.WebResponseUtils;
 
 @RestController
@@ -45,17 +46,24 @@ import stirling.software.SPDF.utils.WebResponseUtils;
 @Tag(name = "Misc", description = "Miscellaneous APIs")
 public class StampController {
 
+    private final CustomPDDocumentFactory pdfDocumentFactory;
+
+    @Autowired
+    public StampController(CustomPDDocumentFactory pdfDocumentFactory) {
+        this.pdfDocumentFactory = pdfDocumentFactory;
+    }
+
     @PostMapping(consumes = "multipart/form-data", value = "/add-stamp")
     @Operation(
             summary = "Add stamp to a PDF file",
             description =
-                    "This endpoint adds a stamp to a given PDF file. Users can specify the watermark type (text or image), rotation, opacity, width spacer, and height spacer. Input:PDF Output:PDF Type:SISO")
+                    "This endpoint adds a stamp to a given PDF file. Users can specify the stamp type (text or image), rotation, opacity, width spacer, and height spacer. Input:PDF Output:PDF Type:SISO")
     public ResponseEntity<byte[]> addStamp(@ModelAttribute AddStampRequest request)
             throws IOException, Exception {
         MultipartFile pdfFile = request.getFileInput();
-        String watermarkType = request.getStampType();
-        String watermarkText = request.getStampText();
-        MultipartFile watermarkImage = request.getStampImage();
+        String stampType = request.getStampType();
+        String stampText = request.getStampText();
+        MultipartFile stampImage = request.getStampImage();
         String alphabet = request.getAlphabet();
         float fontSize = request.getFontSize();
         float rotation = request.getRotation();
@@ -86,9 +94,9 @@ public class StampController {
         }
 
         // Load the input PDF
-        PDDocument document = Loader.loadPDF(pdfFile.getBytes());
+        PDDocument document = pdfDocumentFactory.load(pdfFile);
 
-        List<Integer> pageNumbers = request.getPageNumbersList();
+        List<Integer> pageNumbers = request.getPageNumbersList(document, true);
 
         for (int pageIndex : pageNumbers) {
             int zeroBasedIndex = pageIndex - 1;
@@ -105,10 +113,10 @@ public class StampController {
                 graphicsState.setNonStrokingAlphaConstant(opacity);
                 contentStream.setGraphicsStateParameters(graphicsState);
 
-                if ("text".equalsIgnoreCase(watermarkType)) {
+                if ("text".equalsIgnoreCase(stampType)) {
                     addTextStamp(
                             contentStream,
-                            watermarkText,
+                            stampText,
                             document,
                             page,
                             rotation,
@@ -119,10 +127,10 @@ public class StampController {
                             overrideY,
                             margin,
                             customColor);
-                } else if ("image".equalsIgnoreCase(watermarkType)) {
+                } else if ("image".equalsIgnoreCase(stampType)) {
                     addImageStamp(
                             contentStream,
-                            watermarkImage,
+                            stampImage,
                             document,
                             page,
                             rotation,
@@ -140,12 +148,12 @@ public class StampController {
                 document,
                 Filenames.toSimpleFileName(pdfFile.getOriginalFilename())
                                 .replaceFirst("[.][^.]+$", "")
-                        + "_watermarked.pdf");
+                        + "_stamped.pdf");
     }
 
     private void addTextStamp(
             PDPageContentStream contentStream,
-            String watermarkText,
+            String stampText,
             PDDocument document,
             PDPage page,
             float rotation,
@@ -185,10 +193,12 @@ public class StampController {
             try (InputStream is = classPathResource.getInputStream();
                     FileOutputStream os = new FileOutputStream(tempFile)) {
                 IOUtils.copy(is, os);
+                font = PDType0Font.load(document, tempFile);
+            } finally {
+                if (tempFile != null) {
+                    Files.deleteIfExists(tempFile.toPath());
+                }
             }
-
-            font = PDType0Font.load(document, tempFile);
-            tempFile.deleteOnExit();
         }
 
         contentStream.setFont(font, fontSize);
@@ -214,23 +224,33 @@ public class StampController {
             x = overrideX;
             y = overrideY;
         } else {
-            x =
-                    calculatePositionX(
-                            pageSize, position, fontSize, font, fontSize, watermarkText, margin);
+            x = calculatePositionX(pageSize, position, fontSize, font, fontSize, stampText, margin);
             y =
                     calculatePositionY(
                             pageSize, position, calculateTextCapHeight(font, fontSize), margin);
         }
+        // Split the stampText into multiple lines
+        String[] lines = stampText.split("\\\\n");
+
+        // Calculate dynamic line height based on font ascent and descent
+        float ascent = font.getFontDescriptor().getAscent();
+        float descent = font.getFontDescriptor().getDescent();
+        float lineHeight = ((ascent - descent) / 1000) * fontSize;
 
         contentStream.beginText();
-        contentStream.setTextMatrix(Matrix.getRotateInstance(Math.toRadians(rotation), x, y));
-        contentStream.showText(watermarkText);
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i];
+            // Set the text matrix for each line with rotation
+            contentStream.setTextMatrix(
+                    Matrix.getRotateInstance(Math.toRadians(rotation), x, y - (i * lineHeight)));
+            contentStream.showText(line);
+        }
         contentStream.endText();
     }
 
     private void addImageStamp(
             PDPageContentStream contentStream,
-            MultipartFile watermarkImage,
+            MultipartFile stampImage,
             PDDocument document,
             PDPage page,
             float rotation,
@@ -241,8 +261,8 @@ public class StampController {
             float margin)
             throws IOException {
 
-        // Load the watermark image
-        BufferedImage image = ImageIO.read(watermarkImage.getInputStream());
+        // Load the stamp image
+        BufferedImage image = ImageIO.read(stampImage.getInputStream());
 
         // Compute width based on original aspect ratio
         float aspectRatio = (float) image.getWidth() / (float) image.getHeight();
